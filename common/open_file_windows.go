@@ -22,7 +22,7 @@ import (
 // Windows.
 
 const (
-	_FILE_WRITE_EA        = 0x00000010
+	_FILE_WRITE_EA = 0x00000010
 )
 
 var getwdCache struct {
@@ -110,9 +110,11 @@ func open(name string, flag int, perm uint32) (fd syscall.Handle, err error) {
 		// Set all access rights granted by GENERIC_WRITE except for FILE_WRITE_DATA.
 		access |= syscall.FILE_APPEND_DATA | syscall.FILE_WRITE_ATTRIBUTES | _FILE_WRITE_EA | syscall.STANDARD_RIGHTS_WRITE | syscall.SYNCHRONIZE
 	}
-    // We add the FILE_SHARE_DELETE flag which allows the open file to be renamed and deleted before being closed.
+	// We add the FILE_SHARE_DELETE flag which allows the open file to be renamed and deleted before being closed.
 	// This is not enabled in Go.
-	sharemode := uint32(syscall.FILE_SHARE_READ | syscall.FILE_SHARE_WRITE | syscall.FILE_SHARE_DELETE)
+	sharemode := uint32(
+		syscall.FILE_SHARE_READ | syscall.FILE_SHARE_WRITE | syscall.FILE_SHARE_DELETE,
+	)
 	var sa *syscall.SecurityAttributes
 	if flag&syscall.O_CLOEXEC == 0 {
 		sa = makeInheritSa()
@@ -210,7 +212,8 @@ func addExtendedPrefix(path string) string {
 			// Already extended with \??\
 			return path
 		}
-		if os.IsPathSeparator(path[0]) && os.IsPathSeparator(path[1]) && path[2] == '?' && os.IsPathSeparator(path[3]) {
+		if os.IsPathSeparator(path[0]) && os.IsPathSeparator(path[1]) && path[2] == '?' &&
+			os.IsPathSeparator(path[3]) {
 			// Already extended with \\?\ or any combination of directory separators.
 			return path
 		}

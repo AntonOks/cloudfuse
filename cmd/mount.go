@@ -28,7 +28,6 @@ package cmd
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -63,8 +62,9 @@ type LogOptions struct {
 }
 
 type mountOptions struct {
-	MountPath  string
-	ConfigFile string
+	MountPath      string
+	inputMountPath string
+	ConfigFile     string
 
 	DryRun              bool
 	Logging             LogOptions     `config:"logging"`
@@ -82,16 +82,13 @@ type mountOptions struct {
 	MonitorOpt          monitorOptions `config:"health_monitor"`
 	WaitForMount        time.Duration  `config:"wait-for-mount"`
 	LazyWrite           bool           `config:"lazy-write"`
+	EntryCacheTimeout   int            `config:"list-cache-timeout"`
 	EnableRemountUser   bool
 	EnableRemountSystem bool
+	ServiceUser         string
 	PassphrasePipe      string
 
-	// v1 support
-	Streaming         bool     `config:"streaming"`
-	AttrCache         bool     `config:"use-attr-cache"`
-	LibfuseOptions    []string `config:"libfuse-options"`
-	BlockCache        bool     `config:"block-cache"`
-	EntryCacheTimeout int      `config:"list-cache-timeout"`
+	LibfuseOptions []string `config:"libfuse-options"`
 }
 
 var options mountOptions
@@ -111,36 +108,19 @@ func (opt *mountOptions) validate(skipNonEmptyMount bool) error {
 		}
 	} else {
 		if _, err := os.Stat(opt.MountPath); os.IsNotExist(err) {
-			return fmt.Errorf("mount directory does not exists")
-		} else if !skipNonEmptyMount && !common.IsDirectoryEmpty(opt.MountPath) {
-			return fmt.Errorf("mount directory is not empty")
-		}
-
-		if common.IsDirectoryMounted(opt.MountPath) {
+			return fmt.Errorf("mount directory does not exist")
+		} else if common.IsDirectoryMounted(opt.MountPath) {
 			// Try to cleanup the stale mount
 			log.Info("Mount::validate : Mount directory is already mounted, trying to cleanup")
-			active, err := common.IsMountActive(opt.MountPath)
+			active, err := common.IsMountActive(opt.inputMountPath)
 			if active || err != nil {
 				// Previous mount is still active so we need to fail this mount
 				return fmt.Errorf("directory is already mounted")
 			} else {
 				// Previous mount is in stale state so lets cleanup the state
 				log.Info("Mount::validate : Cleaning up stale mount")
-				if err = unmountCloudfuse(opt.MountPath, true); err != nil {
+				if err = unmountCloudfuse(opt.MountPath, true, true); err != nil {
 					return fmt.Errorf("directory is already mounted, unmount manually before remount [%v]", err.Error())
-				}
-
-				// Clean up the file-cache temp directory if any
-				var tempCachePath string
-				_ = config.UnmarshalKey("file_cache.path", &tempCachePath)
-
-				var cleanupOnStart bool
-				_ = config.UnmarshalKey("file_cache.cleanup-on-start", &cleanupOnStart)
-
-				if tempCachePath != "" && cleanupOnStart {
-					if err = common.TempCacheCleanup(tempCachePath); err != nil {
-						return fmt.Errorf("failed to cleanup file cache [%s]", err.Error())
-					}
 				}
 			}
 		} else if !skipNonEmptyMount && !common.IsDirectoryEmpty(opt.MountPath) {
@@ -234,11 +214,6 @@ func parseConfig() error {
 					"no passphrase provided to decrypt the config file.\n Either use --passphrase cli option or store passphrase in CLOUDFUSE_SECURE_CONFIG_PASSPHRASE environment variable",
 				)
 			}
-
-			_, err := base64.StdEncoding.DecodeString(string(options.PassPhrase))
-			if err != nil {
-				return fmt.Errorf("passphrase is not valid base64 encoded [%s]", err.Error())
-			}
 		} else if options.PassphrasePipe != "" && runtime.GOOS == "windows" {
 			var err error
 			options.PassPhrase, err = readPassphraseFromPipe(options.PassphrasePipe, 10*time.Second)
@@ -296,8 +271,11 @@ var mountCmd = &cobra.Command{
 	Args:              cobra.ExactArgs(1),
 	FlagErrorHandling: cobra.ExitOnError,
 	RunE: func(_ *cobra.Command, args []string) error {
+		options.inputMountPath = args[0]
 		options.MountPath = common.ExpandPath(args[0])
 		common.MountPath = options.MountPath
+
+		directIO := false
 
 		if options.ConfigFile == "" {
 			// Config file is not set in cli parameters
@@ -353,21 +331,7 @@ var mountCmd = &cobra.Command{
 		}
 
 		if len(options.Components) == 0 {
-			pipeline := []string{"libfuse"}
-
-			if config.IsSet("streaming") && options.Streaming {
-				pipeline = append(pipeline, "stream")
-			} else if config.IsSet("block-cache") && options.BlockCache {
-				pipeline = append(pipeline, "block_cache")
-			} else {
-				pipeline = append(pipeline, "file_cache")
-			}
-
-			// by default attr-cache is enable in v2
-			// only way to disable is to pass cli param and set it to false
-			if options.AttrCache {
-				pipeline = append(pipeline, "attr_cache")
-			}
+			pipeline := []string{"libfuse", "file_cache", "attr_cache"}
 
 			if containers, err := getBucketListS3(); len(containers) != 0 && err == nil {
 				pipeline = append(pipeline, "s3storage")
@@ -383,6 +347,24 @@ var mountCmd = &cobra.Command{
 			options.Components = append(
 				options.Components[:1],
 				append([]string{"entry_cache"}, options.Components[1:]...)...)
+		}
+
+		if err = common.ValidatePipeline(options.Components); err != nil {
+			// file-cache, block-cache and xload are mutually exclusive
+			log.Err("mount: invalid pipeline components [%s]", err.Error())
+			return fmt.Errorf("invalid pipeline components [%s]", err.Error())
+		}
+
+		// Passed in config file
+		if common.ComponentInPipeline(options.Components, "block_cache") {
+			// CLI overriding the pipeline to inject block-cache
+			options.Components = common.UpdatePipeline(options.Components, "block_cache")
+		}
+
+		if common.ComponentInPipeline(options.Components, "xload") {
+			// CLI overriding the pipeline to inject xload
+			options.Components = common.UpdatePipeline(options.Components, "xload")
+			config.Set("read-only", "true") // preload is only supported in read-only mode
 		}
 
 		if config.IsSet("libfuse-options") {
@@ -434,10 +416,24 @@ var mountCmd = &cobra.Command{
 				} else if v == "direct_io" || v == "direct_io=true" {
 					config.Set("lfuse.direct-io", "true")
 					config.Set("direct-io", "true")
+					directIO = true
 				} else {
 					return errors.New(common.FuseAllowedFlags)
 				}
 			}
+		}
+
+		// Check if direct-io is enabled in the config file.
+		if !directIO {
+			_ = config.UnmarshalKey("libfuse.direct-io", &directIO)
+			if directIO {
+				config.Set("direct-io", "true")
+			}
+		}
+
+		if config.IsSet("disable-kernel-cache") && directIO {
+			// Both flag shall not be enable together
+			return fmt.Errorf("direct-io and disable-kernel-cache cannot be enabled together")
 		}
 
 		if !config.IsSet("logging.file-path") {
@@ -478,23 +474,6 @@ var mountCmd = &cobra.Command{
 			}
 		}
 
-		// TODO: remove v1 switches, which were never used as part of cloudfuse.
-		if config.IsSet("invalidate-on-sync") {
-			log.Warn(
-				"mount: unsupported v1 CLI parameter: invalidate-on-sync is always true in cloudfuse.",
-			)
-		}
-		if config.IsSet("pre-mount-validate") {
-			log.Warn(
-				"mount: unsupported v1 CLI parameter: pre-mount-validate is always true in cloudfuse.",
-			)
-		}
-		if config.IsSet("basic-remount-check") {
-			log.Warn(
-				"mount: unsupported v1 CLI parameter: basic-remount-check is always true in cloudfuse.",
-			)
-		}
-
 		common.EnableMonitoring = options.MonitorOpt.EnableMon
 
 		// check if cloudfuse stats monitor is added in the disable list
@@ -518,10 +497,8 @@ var mountCmd = &cobra.Command{
 		log.Crit("Logging level set to : %s", logLevel.String())
 		log.Debug("Mount allowed on nonempty path : %v", options.NonEmpty)
 
-		directIO := false
-		_ = config.UnmarshalKey("direct-io", &directIO)
 		if directIO {
-			// Directio is enabled, so remove the attr-cache from the pipeline
+			// Direct IO is enabled, so remove the attr-cache from the pipeline
 			for i, name := range options.Components {
 				if name == "attr_cache" {
 					options.Components = append(options.Components[:i], options.Components[i+1:]...)
@@ -532,6 +509,15 @@ var mountCmd = &cobra.Command{
 				}
 			}
 		}
+
+		// Clean up any cache directory if cleanup-on-start is set from the cli parameter or specified in parameter in
+		// config file for a specific component for file-cache, block-cache, xload.
+		err = options.tempCacheCleanup()
+		if err != nil {
+			return err
+		}
+
+		common.ForegroundMount = options.Foreground
 
 		// If on Linux start with the go daemon
 		// If on Windows, don't use the daemon since it is not supported
@@ -567,8 +553,6 @@ var mountCmd = &cobra.Command{
 			return nil
 		}
 
-		common.ForegroundMount = options.Foreground
-
 		log.Info("mount: Mounting cloudfuse on %s", options.MountPath)
 		// handle background mount on Linux
 		if !options.Foreground && runtime.GOOS != "windows" {
@@ -582,13 +566,43 @@ var mountCmd = &cobra.Command{
 				return fmt.Errorf("mount: failed to remove pidFile [%v]", err.Error())
 			}
 
-			pid := os.Getpid()
-			fname := fmt.Sprintf("/tmp/cloudfuse.%v", pid)
+			if options.EnableRemountSystem {
+				// Check if the user exists
+				if options.ServiceUser == "" {
+					return fmt.Errorf(
+						"mount: service user is required when enabling remount as system on Linux. " +
+							"Pass --service-remount-user with the user the service will run as on remount",
+					)
+				}
 
-			ctx := context.Background()
-			err = createDaemon(pipeline, ctx, pidFileName, 0644, 022, fname)
-			if err != nil {
-				return fmt.Errorf("mount: failed to create daemon [%v]", err.Error())
+				serviceName, err := installRemountService(
+					options.ServiceUser,
+					options.MountPath,
+					options.ConfigFile,
+				)
+				if err != nil {
+					return fmt.Errorf(
+						"mount: failed to install service to remount on restart [%v]",
+						err.Error(),
+					)
+				}
+
+				err = startService(serviceName)
+				if err != nil {
+					return fmt.Errorf(
+						"mount: failed to start service using remount on restart [%v]",
+						err.Error(),
+					)
+				}
+			} else {
+				pid := os.Getpid()
+				fname := fmt.Sprintf("/tmp/cloudfuse.%v", pid)
+
+				ctx := context.Background()
+				err = createDaemon(pipeline, ctx, pidFileName, 0644, 022, fname)
+				if err != nil {
+					return fmt.Errorf("mount: failed to create daemon [%v]", err.Error())
+				}
 			}
 		} else {
 			if options.CPUProfile != "" {
@@ -693,6 +707,56 @@ func startMonitor(pid int) {
 	}
 }
 
+// cleanupCachePath is a helper function to clean up cache directory for a component that is present in the pipeline.
+// componentName: the name of the component (e.g., "file_cache", "block_cache")
+func (opt *mountOptions) tempCacheCleanup() error {
+	// Check for global cleanup-on-start flag from cli.
+	var cleanupOnStart bool
+	_ = config.UnmarshalKey("cleanup-on-start", &cleanupOnStart)
+
+	components := []string{"file_cache", "block_cache", "xload"}
+
+	for _, component := range components {
+		if common.ComponentInPipeline(options.Components, component) {
+			err := cleanupCachePath(component, cleanupOnStart)
+			if err != nil {
+				return fmt.Errorf("failed to clean up  cache for %s: %v", component, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+func cleanupCachePath(componentName string, globalCleanupFlag bool) error {
+	// Get the path for the component
+	var cachePath string
+	_ = config.UnmarshalKey(componentName+".path", &cachePath)
+
+	if cachePath == "" {
+		// No path configured for this component
+		return nil
+	}
+
+	// Check for component-specific cleanup flag
+	var componentCleanupFlag bool
+	_ = config.UnmarshalKey(componentName+".cleanup-on-start", &componentCleanupFlag)
+
+	// Clean up if either global or component-specific flag is set
+	if globalCleanupFlag || componentCleanupFlag {
+		if err := common.TempCacheCleanup(cachePath); err != nil {
+			return fmt.Errorf(
+				"failed to cleanup temp cache path: %s for %s component: %v",
+				cachePath,
+				componentName,
+				err,
+			)
+		}
+	}
+
+	return nil
+}
+
 func setGOConfig() {
 	// Ensure we always have more than 1 OS thread running goroutines, since there are issues with having just 1.
 	isOnlyOne := runtime.GOMAXPROCS(0) == 1
@@ -752,7 +816,7 @@ func init() {
 		"Encrypt auto generated config file for each container")
 
 	mountCmd.PersistentFlags().StringVar(&options.PassPhrase, "passphrase", "",
-		"Base64 encoded key to decrypt config file. Can also be specified by env-variable CLOUDFUSE_SECURE_CONFIG_PASSPHRASE.\n Decoded key length shall be 16 (AES-128), 24 (AES-192), or 32 (AES-256) bytes in length.")
+		"Password to decrypt config file. Can also be specified by env-variable CLOUDFUSE_SECURE_CONFIG_PASSPHRASE.")
 
 	mountCmd.PersistentFlags().
 		String("log-type", "base", "Type of logger to be used by the system. Set to base by default. Allowed values are silent|syslog|base.")
@@ -763,6 +827,11 @@ func init() {
 			return []string{"silent", "base", "syslog"}, cobra.ShellCompDirectiveNoFileComp
 		},
 	)
+
+	// Add a generic cleanup-on-start flag that applies to all cache components
+	mountCmd.PersistentFlags().
+		Bool("cleanup-on-start", false, "Clear cache directory on startup if not empty for file_cache, block_cache, xload components.")
+	config.BindPFlag("cleanup-on-start", mountCmd.PersistentFlags().Lookup("cleanup-on-start"))
 
 	mountCmd.PersistentFlags().String("log-level", "LOG_WARNING",
 		"Enables logs written to syslog. Set to LOG_WARNING by default. Allowed values are LOG_OFF|LOG_CRIT|LOG_ERR|LOG_WARNING|LOG_INFO|LOG_DEBUG")
@@ -812,18 +881,6 @@ func init() {
 	)
 	_ = mountCmd.MarkPersistentFlagDirname("default-working-dir")
 
-	mountCmd.Flags().BoolVar(&options.Streaming, "streaming", false, "Enable Streaming.")
-	config.BindPFlag("streaming", mountCmd.Flags().Lookup("streaming"))
-	mountCmd.Flags().Lookup("streaming").Hidden = true
-
-	mountCmd.Flags().BoolVar(&options.BlockCache, "block-cache", false, "Enable Block-Cache.")
-	config.BindPFlag("block-cache", mountCmd.Flags().Lookup("block-cache"))
-	mountCmd.Flags().Lookup("block-cache").Hidden = true
-
-	mountCmd.Flags().BoolVar(&options.AttrCache, "use-attr-cache", true, "Use attribute caching.")
-	config.BindPFlag("use-attr-cache", mountCmd.Flags().Lookup("use-attr-cache"))
-	mountCmd.Flags().Lookup("use-attr-cache").Hidden = true
-
 	mountCmd.Flags().Bool("invalidate-on-sync", true, "Invalidate file/dir on sync/fsync.")
 	config.BindPFlag("invalidate-on-sync", mountCmd.Flags().Lookup("invalidate-on-sync"))
 	mountCmd.Flags().Lookup("invalidate-on-sync").Hidden = true
@@ -837,11 +894,11 @@ func init() {
 	config.BindPFlag("basic-remount-check", mountCmd.Flags().Lookup("basic-remount-check"))
 	mountCmd.Flags().Lookup("basic-remount-check").Hidden = true
 
-	if runtime.GOOS == "windows" {
-		mountCmd.Flags().
-			BoolVar(&options.EnableRemountSystem, "enable-remount-system", false, "Remount container on server restart. Mount will restart on reboot.")
-		config.BindPFlag("enable-remount-system", mountCmd.Flags().Lookup("enable-remount-system"))
+	mountCmd.Flags().
+		BoolVar(&options.EnableRemountSystem, "enable-remount-system", false, "Remount container on server restart. Mount will restart on reboot.")
+	config.BindPFlag("enable-remount-system", mountCmd.Flags().Lookup("enable-remount-system"))
 
+	if runtime.GOOS == "windows" {
 		mountCmd.Flags().
 			BoolVar(&options.EnableRemountUser, "enable-remount-user", false, "Remount container on server restart for current user. Mount will restart on current user log in.")
 		config.BindPFlag("enable-remount-user", mountCmd.Flags().Lookup("enable-remount-user"))
@@ -849,6 +906,12 @@ func init() {
 		mountCmd.Flags().
 			StringVar(&options.PassphrasePipe, "passphrase-pipe", "", "Specifies a named pipe to read the passphrase from.")
 		config.BindPFlag("passphrase-pipe", mountCmd.Flags().Lookup("passphrase-pipe"))
+	}
+
+	if runtime.GOOS == "linux" {
+		mountCmd.Flags().
+			StringVar(&options.ServiceUser, "remount-system-user", "", "User that the service remount will run as.")
+		config.BindPFlag("remount-system-user", mountCmd.Flags().Lookup("remount-system-user"))
 	}
 
 	mountCmd.PersistentFlags().
@@ -859,6 +922,13 @@ func init() {
 	mountCmd.PersistentFlags().
 		DurationVar(&options.WaitForMount, "wait-for-mount", 5*time.Second, "Let parent process wait for given timeout before exit")
 
+	mountCmd.PersistentFlags().
+		Bool("disable-kernel-cache", false, "Disable kerneel cache, but keep blobfuse cache. Default value false.")
+	config.BindPFlag(
+		"disable-kernel-cache",
+		mountCmd.PersistentFlags().Lookup("disable-kernel-cache"),
+	)
+
 	config.AttachToFlagSet(mountCmd.PersistentFlags())
 	config.AttachFlagCompletions(mountCmd)
 	config.AddConfigChangeEventListener(config.ConfigChangeEventHandlerFunc(OnConfigChange))
@@ -866,5 +936,9 @@ func init() {
 
 func Destroy(message string) error {
 	_ = log.Destroy()
-	return fmt.Errorf("%s", message)
+	if message != "" {
+		return fmt.Errorf("%s", message)
+	}
+
+	return nil
 }

@@ -43,8 +43,6 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
-
-	"github.com/spf13/cobra"
 )
 
 // AzStorage Wrapper type around azure go-sdk (track-1)
@@ -104,6 +102,8 @@ func (az *AzStorage) Configure(isParent bool) error {
 		return err
 	}
 
+reconfigure:
+
 	err = ParseAndValidateConfig(az, conf)
 	if err != nil {
 		log.Err("AzStorage::Configure : Config validation failed [%s]", err.Error())
@@ -114,6 +114,16 @@ func (az *AzStorage) Configure(isParent bool) error {
 	if err != nil {
 		log.Err("AzStorage::Configure : Failed to validate storage account [%s]", err.Error())
 		return err
+	}
+
+	// If user has not specified the account type then detect it's HNS or FNS
+	if conf.AccountType == "" && az.storage.IsAccountADLS() {
+		log.Crit(
+			"AzStorage::Configure : Auto detected account type as adls, reconfiguring storage connection.",
+		)
+		az.storage = nil
+		conf.AccountType = "adls"
+		goto reconfigure
 	}
 
 	return nil
@@ -176,7 +186,11 @@ func (az *AzStorage) configureAndTest(isParent bool) error {
 				"AzStorage::configureAndTest : Failed to validate credentials [%s]",
 				err.Error(),
 			)
-			return fmt.Errorf("failed to authenticate credentials for %s", az.Name())
+			return fmt.Errorf(
+				"failed to authenticate %s credentials with error [%s]",
+				az.Name(),
+				err.Error(),
+			)
 		}
 	}
 
@@ -565,12 +579,26 @@ func (az *AzStorage) RenameFile(options internal.RenameFileOptions) error {
 func (az *AzStorage) ReadInBuffer(options internal.ReadInBufferOptions) (length int, err error) {
 	//log.Trace("AzStorage::ReadInBuffer : Read %s from %d offset", h.Path, offset)
 
-	if options.Offset > atomic.LoadInt64(&options.Handle.Size) {
+	var size int64
+	var path string
+	if options.Handle != nil {
+		size = atomic.LoadInt64(&options.Handle.Size)
+		path = options.Handle.Path
+	} else {
+		size = options.Size
+		path = options.Path
+		if len(path) == 0 {
+			log.Err("AzStorage::ReadInBuffer : Path not given for download")
+			return 0, fmt.Errorf("path not given for download")
+		}
+	}
+
+	if options.Offset > size {
 		return 0, syscall.ERANGE
 	}
 
 	var dataLen = int64(len(options.Data))
-	if atomic.LoadInt64(&options.Handle.Size) < (options.Offset + int64(len(options.Data))) {
+	if size < (options.Offset + int64(len(options.Data))) {
 		dataLen = options.Handle.Size - options.Offset
 	}
 
@@ -578,24 +606,14 @@ func (az *AzStorage) ReadInBuffer(options internal.ReadInBufferOptions) (length 
 		return 0, nil
 	}
 
-	err = az.storage.ReadInBuffer(
-		az.ctx,
-		options.Handle.Path,
-		options.Offset,
-		dataLen,
-		options.Data,
-		options.Etag,
-	)
+	length = int(dataLen)
+	err = az.storage.ReadInBuffer(az.ctx, path, options.Offset, dataLen, options.Data, options.Etag)
 	az.updateConnectionState(err)
 	if err != nil {
-		log.Err(
-			"AzStorage::ReadInBuffer : Failed to read %s [%s]",
-			options.Handle.Path,
-			err.Error(),
-		)
+		log.Err("AzStorage::ReadInBuffer : Failed to read %s [%s]", path, err.Error())
+		length = 0
 	}
 
-	length = int(dataLen)
 	return
 }
 
@@ -781,159 +799,4 @@ func NewazstorageComponent() internal.Component {
 func init() {
 	internal.AddComponent(compName, NewazstorageComponent)
 	RegisterEnvVariables()
-
-	useHttps := config.AddBoolFlag(
-		"use-https",
-		true,
-		"Enables HTTPS communication with Blob storage.",
-	)
-	config.BindPFlag(compName+".use-https", useHttps)
-	useHttps.Hidden = true
-
-	blockListSecFlag := config.AddInt32Flag(
-		"cancel-list-on-mount-seconds",
-		0,
-		"Number of seconds list call is blocked post mount",
-	)
-	config.BindPFlag(compName+".block-list-on-mount-sec", blockListSecFlag)
-	blockListSecFlag.Hidden = true
-
-	containerNameFlag := config.AddStringFlag(
-		"container-name",
-		"",
-		"Configures the name of the container to be mounted",
-	)
-	config.BindPFlag(compName+".container", containerNameFlag)
-
-	useAdls := config.AddBoolFlag(
-		"use-adls",
-		false,
-		"Enables cloudfuse to access Azure DataLake storage account.",
-	)
-	config.BindPFlag(compName+".use-adls", useAdls)
-	useAdls.Hidden = true
-
-	maxConcurrency := config.AddUint16Flag(
-		"max-concurrency",
-		32,
-		"Option to override default number of concurrent storage connections",
-	)
-	config.BindPFlag(compName+".max-concurrency", maxConcurrency)
-	maxConcurrency.Hidden = true
-
-	httpProxy := config.AddStringFlag("http-proxy", "", "HTTP Proxy address.")
-	config.BindPFlag(compName+".http-proxy", httpProxy)
-	httpProxy.Hidden = true
-
-	httpsProxy := config.AddStringFlag("https-proxy", "", "HTTPS Proxy address.")
-	config.BindPFlag(compName+".https-proxy", httpsProxy)
-	httpsProxy.Hidden = true
-
-	maxRetry := config.AddUint16Flag(
-		"max-retry",
-		3,
-		"Maximum retry count if the failure codes are retryable.",
-	)
-	config.BindPFlag(compName+".max-retries", maxRetry)
-	maxRetry.Hidden = true
-
-	maxRetryInterval := config.AddUint16Flag(
-		"max-retry-interval-in-seconds",
-		3,
-		"Maximum number of seconds between 2 retries.",
-	)
-	config.BindPFlag(compName+".max-retry-timeout-sec", maxRetryInterval)
-	maxRetryInterval.Hidden = true
-
-	retryDelayFactor := config.AddUint16Flag(
-		"retry-delay-factor",
-		1,
-		"Retry delay between two tries",
-	)
-	config.BindPFlag(compName+".retry-backoff-sec", retryDelayFactor)
-	retryDelayFactor.Hidden = true
-
-	setContentType := config.AddBoolFlag(
-		"set-content-type",
-		true,
-		"Turns on automatic 'content-type' property based on the file extension.",
-	)
-	config.BindPFlag(compName+".set-content-type", setContentType)
-	setContentType.Hidden = true
-
-	caCertFile := config.AddStringFlag(
-		"ca-cert-file",
-		"",
-		"Specifies the proxy pem certificate path if its not in the default path.",
-	)
-	config.BindPFlag(compName+".ca-cert-file", caCertFile)
-	caCertFile.Hidden = true
-
-	debugLibcurl := config.AddStringFlag(
-		"debug-libcurl",
-		"",
-		"Flag to allow users to debug libcurl calls.",
-	)
-	config.BindPFlag(compName+".debug-libcurl", debugLibcurl)
-	debugLibcurl.Hidden = true
-
-	virtualDir := config.AddBoolFlag(
-		"virtual-directory",
-		false,
-		"Support virtual directories without existence of a special marker blob.",
-	)
-	config.BindPFlag(compName+".virtual-directory", virtualDir)
-
-	subDirectory := config.AddStringFlag(
-		"subdirectory",
-		"",
-		"Mount only this sub-directory from given container.",
-	)
-	config.BindPFlag(compName+".subdirectory", subDirectory)
-
-	disableCompression := config.AddBoolFlag(
-		"disable-compression",
-		false,
-		"Disable transport layer compression.",
-	)
-	config.BindPFlag(compName+".disable-compression", disableCompression)
-
-	telemetry := config.AddStringFlag("telemetry", "", "Additional telemetry information.")
-	config.BindPFlag(compName+".telemetry", telemetry)
-	telemetry.Hidden = true
-
-	honourACL := config.AddBoolFlag(
-		"honour-acl",
-		false,
-		"Match ObjectID in ACL against the one used for authentication.",
-	)
-	config.BindPFlag(compName+".honour-acl", honourACL)
-	honourACL.Hidden = true
-
-	restrictedCharsWin := config.AddBoolFlag(
-		"restricted-characters-windows",
-		false,
-		"Enable support for displaying restricted characters on Windows.",
-	)
-	config.BindPFlag("restricted-characters-windows", restrictedCharsWin)
-
-	cpkEnabled := config.AddBoolFlag("cpk-enabled", false, "Enable client provided key.")
-	config.BindPFlag(compName+".cpk-enabled", cpkEnabled)
-
-	preserveACL := config.AddBoolFlag(
-		"preserve-acl",
-		false,
-		"Preserve ACL and Permissions set on file during updates",
-	)
-	config.BindPFlag(compName+".preserve-acl", preserveACL)
-
-	blobFilter := config.AddStringFlag("filter", "", "Filter string to match blobs")
-	config.BindPFlag(compName+".filter", blobFilter)
-
-	config.RegisterFlagCompletionFunc(
-		"container-name",
-		func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-			return nil, cobra.ShellCompDirectiveNoFileComp
-		},
-	)
 }

@@ -199,7 +199,6 @@ func (suite *fileCacheTestSuite) TestEmpty() {
 	suite.assert.False(suite.fileCache.createEmptyFile)
 	suite.assert.False(suite.fileCache.allowNonEmpty)
 	suite.assert.EqualValues(suite.fileCache.cacheTimeout, 216000)
-	suite.assert.False(suite.fileCache.cleanupOnStart)
 	suite.assert.True(suite.fileCache.syncToFlush)
 }
 
@@ -247,8 +246,6 @@ func (suite *fileCacheTestSuite) TestConfig() {
 	suite.assert.Equal(suite.fileCache.createEmptyFile, createEmptyFile)
 	suite.assert.Equal(suite.fileCache.allowNonEmpty, allowNonEmptyTemp)
 	suite.assert.EqualValues(suite.fileCache.cacheTimeout, cacheTimeout)
-	suite.assert.Equal(suite.fileCache.cleanupOnStart, cleanupOnStart)
-	suite.assert.Equal(suite.fileCache.syncToFlush, syncToFlush)
 }
 
 func (suite *fileCacheTestSuite) TestDefaultCacheSize() {
@@ -331,7 +328,6 @@ func (suite *fileCacheTestSuite) TestConfigPolicyTimeout() {
 	suite.assert.Equal(suite.fileCache.createEmptyFile, createEmptyFile)
 	suite.assert.Equal(suite.fileCache.allowNonEmpty, allowNonEmptyTemp)
 	suite.assert.EqualValues(suite.fileCache.cacheTimeout, cacheTimeout)
-	suite.assert.Equal(suite.fileCache.cleanupOnStart, cleanupOnStart)
 }
 
 func (suite *fileCacheTestSuite) TestConfigPolicyDefaultTimeout() {
@@ -375,7 +371,6 @@ func (suite *fileCacheTestSuite) TestConfigPolicyDefaultTimeout() {
 	suite.assert.Equal(suite.fileCache.createEmptyFile, createEmptyFile)
 	suite.assert.Equal(suite.fileCache.allowNonEmpty, allowNonEmptyTemp)
 	suite.assert.EqualValues(suite.fileCache.cacheTimeout, cacheTimeout)
-	suite.assert.Equal(suite.fileCache.cleanupOnStart, cleanupOnStart)
 }
 
 func (suite *fileCacheTestSuite) TestConfigZero() {
@@ -419,7 +414,6 @@ func (suite *fileCacheTestSuite) TestConfigZero() {
 	suite.assert.Equal(suite.fileCache.createEmptyFile, createEmptyFile)
 	suite.assert.Equal(suite.fileCache.allowNonEmpty, allowNonEmptyTemp)
 	suite.assert.EqualValues(suite.fileCache.cacheTimeout, minimumFileCacheTimeout)
-	suite.assert.Equal(suite.fileCache.cleanupOnStart, cleanupOnStart)
 }
 
 func (suite *fileCacheTestSuite) TestDefaultFilePath() {
@@ -1516,8 +1510,8 @@ func (suite *fileCacheTestSuite) TestFlushFileErrorBadFd() {
 func (suite *fileCacheTestSuite) TestCronOffToONUpload() {
 	defer suite.cleanupTest()
 
-	now := time.Now()
-	second := (now.Second() + 2) % 60
+	testStartTime := time.Now()
+	second := (testStartTime.Second() + 2) % 60
 	cronExpr := fmt.Sprintf("%d * * * * *", second)
 
 	configContent := fmt.Sprintf(`file_cache:
@@ -1527,10 +1521,7 @@ func (suite *fileCacheTestSuite) TestCronOffToONUpload() {
   schedule:
     - name: "Test"
       cron: %s
-      duration: "2h"
-    - name: "TestWindow"
-      cron: "0 0 9 * * 0"
-      duration: "4h"
+      duration: "30s"
 
 loopbackfs:
   path: %s`,
@@ -1560,7 +1551,7 @@ loopbackfs:
 	suite.assert.True(exists, "File should be in scheduleOps after creation")
 
 	// wait for uploads to start
-	time.Sleep(time.Now().Sub(now.Add(2 * time.Second).Truncate(time.Second)))
+	time.Sleep(time.Until(testStartTime.Add(2 * time.Second).Truncate(time.Second)))
 	_, err = os.Stat(filepath.Join(suite.fake_storage_path, file))
 	for i := 0; i < 200 && os.IsNotExist(err); i++ {
 		time.Sleep(10 * time.Millisecond)
@@ -1591,9 +1582,6 @@ func (suite *fileCacheTestSuite) TestCronOnToOFFUpload() {
     - name: "Test"
       cron: %s
       duration: "%ds"
-    - name: "TestWindow"
-      cron: "0 0 9 * * 0"
-      duration: "5s"
 
 loopbackfs:
   path: %s`,
@@ -1627,7 +1615,7 @@ loopbackfs:
 	)
 
 	// wait until the window closes
-	time.Sleep(time.Now().Sub(testStartTime.Add(duration + 10*time.Millisecond)))
+	time.Sleep(time.Since(testStartTime.Add(duration + 10*time.Millisecond)))
 
 	file2 := "scheduled_off_window.txt"
 	handle2, err := suite.fileCache.CreateFile(internal.CreateFileOptions{Name: file2, Mode: 0777})
@@ -1660,7 +1648,7 @@ loopbackfs:
 	)
 
 	suite.setupTestHelper(configContent)
-	suite.Zero(len(suite.fileCache.schedule), "Should have no schedule entries")
+	suite.assert.Empty(suite.fileCache.schedule, "Should have no schedule entries")
 
 	file := "no_schedule_test.txt"
 	handle, err := suite.fileCache.CreateFile(internal.CreateFileOptions{Name: file, Mode: 0777})
@@ -1702,9 +1690,6 @@ func (suite *fileCacheTestSuite) TestExistingCloudFileImmediateUpload() {
     - name: "Test"
       cron: %s
       duration: "5s"
-    - name: "TestWindow"
-      cron: "0 0 9 * * 0"
-      duration: "5s"
 
 loopbackfs:
   path: %s`,
@@ -1744,7 +1729,7 @@ loopbackfs:
 	// Confirm cloud storage copy is updated
 	fInfo, err := os.Stat(filepath.Join(suite.fake_storage_path, originalFile))
 	suite.NoError(err)
-	suite.assert.EqualValues(fInfo.Size(), len(modifiedContent))
+	suite.assert.Len(modifiedContent, int(fInfo.Size()))
 }
 
 func (suite *fileCacheTestSuite) TestCreateFileAndRename() {
@@ -1761,9 +1746,6 @@ func (suite *fileCacheTestSuite) TestCreateFileAndRename() {
   schedule:
     - name: "Test"
       cron: %s
-      duration: "5s"
-    - name: "TestWindow"
-      cron: "0 0 9 * * 0"
       duration: "5s"
 
 loopbackfs:
@@ -1839,9 +1821,6 @@ func (suite *fileCacheTestSuite) TestDeleteFileAndScheduleOps() {
     - name: "Test"
       cron: %s
       duration: "5s"
-    - name: "TestWindow"
-      cron: "0 0 9 * * 0"
-      duration: "5s"
 
 loopbackfs:
   path: %s`,
@@ -1904,9 +1883,6 @@ func (suite *fileCacheTestSuite) TestCreateEmptyFileEqualTrue() {
     - name: "Test"
       cron: %s
       duration: "5s"
-    - name: "TestWindow"
-      cron: "0 0 9 * * 0"
-      duration: "5s"
 
 loopbackfs:
   path: %s`,
@@ -1956,9 +1932,6 @@ func (suite *fileCacheTestSuite) TestReadWriteLocalFile() {
   schedule:
     - name: "Test"
       cron: %s
-      duration: "5s"
-    - name: "TestWindow"
-      cron: "0 0 9 * * 0"
       duration: "5s"
 
 loopbackfs:
@@ -2881,7 +2854,127 @@ func (suite *fileCacheTestSuite) TestHandleDataChange() {
 	suite.assert.NoError(err)
 }
 
-func (suite *fileCacheTestSuite) createDirectoryStructure() {
+// create a list of empty directories in local and storage and then try to delete those to validate empty directories
+// are allowed be to deleted but non empty are not
+func (suite *fileCacheTestSuite) TestDeleteDirectory() {
+	defer suite.cleanupTest()
+
+	config := fmt.Sprintf("file_cache:\n  path: %s\n  timeout-sec: 1000\n\nloopbackfs:\n  path: %s",
+		suite.cache_path, suite.fake_storage_path)
+	suite.setupTestHelper(
+		config,
+	) // setup a new file cache with a custom config (teardown will occur after the test as usual)
+
+	// Create local and remote dir structures
+	suite.createLocalDirectoryStructure()
+	suite.createRemoteDirectoryStructure()
+
+	// Create a file in the some random directories
+	file := "file43"
+	h, err := suite.fileCache.CreateFile(
+		internal.CreateFileOptions{Name: filepath.Join("a", "b", "c", "d", file), Mode: 0777},
+	)
+	suite.assert.NoError(err)
+	suite.assert.NotNil(h)
+	err = suite.fileCache.CloseFile(internal.CloseFileOptions{Handle: h})
+	suite.assert.NoError(err)
+
+	h, err = suite.fileCache.CreateFile(
+		internal.CreateFileOptions{Name: filepath.Join("a", "b", file), Mode: 0777},
+	)
+	suite.assert.NoError(err)
+	suite.assert.NotNil(h)
+	err = suite.fileCache.CloseFile(internal.CloseFileOptions{Handle: h})
+	suite.assert.NoError(err)
+
+	h, err = suite.fileCache.CreateFile(
+		internal.CreateFileOptions{Name: filepath.Join("h", "l", "m", file), Mode: 0777},
+	)
+	suite.assert.NoError(err)
+	suite.assert.NotNil(h)
+	err = suite.fileCache.CloseFile(internal.CloseFileOptions{Handle: h})
+	suite.assert.NoError(err)
+
+	// Check directories are counted as non empty right now
+	empty := suite.fileCache.IsDirEmpty(internal.IsDirEmptyOptions{Name: filepath.Join("a")})
+	suite.assert.False(empty)
+
+	empty = suite.fileCache.IsDirEmpty(
+		internal.IsDirEmptyOptions{Name: filepath.Join("a", "b", "c", "d")},
+	)
+	suite.assert.False(empty)
+
+	// Validate one empty directory as well
+	empty = suite.fileCache.IsDirEmpty(
+		internal.IsDirEmptyOptions{Name: filepath.Join("a", "b", "e", "f")},
+	)
+	suite.assert.True(empty)
+
+	// Delete file from one of the directory and validate its empty now, but its parent is not empty
+	err = suite.fileCache.DeleteFile(
+		internal.DeleteFileOptions{Name: filepath.Join("a", "b", "c", "d", file)},
+	)
+	suite.assert.NoError(err)
+
+	empty = suite.fileCache.IsDirEmpty(
+		internal.IsDirEmptyOptions{Name: filepath.Join("a", "b", "c", "d")},
+	)
+	suite.assert.True(empty)
+	empty = suite.fileCache.IsDirEmpty(
+		internal.IsDirEmptyOptions{Name: filepath.Join("a", "b", "c")},
+	)
+	suite.assert.False(empty)
+
+	// Delete file only locally and not on remote and validate the directory is still not empty
+	h, err = suite.fileCache.CreateFile(
+		internal.CreateFileOptions{Name: filepath.Join("h", "l", "m", "n", file), Mode: 0777},
+	)
+	suite.assert.NoError(err)
+	suite.assert.NotNil(h)
+	err = suite.fileCache.CloseFile(internal.CloseFileOptions{Handle: h})
+	suite.assert.NoError(err)
+	empty = suite.fileCache.IsDirEmpty(
+		internal.IsDirEmptyOptions{Name: filepath.Join("h", "l", "m", "n")},
+	)
+	suite.assert.False(empty)
+
+	os.Remove(filepath.Join(suite.cache_path, "h", "l", "m", "n", file))
+	empty = suite.fileCache.IsDirEmpty(
+		internal.IsDirEmptyOptions{Name: filepath.Join("h", "l", "m", "n")},
+	)
+	suite.assert.False(empty)
+	os.Remove(filepath.Join(suite.fake_storage_path, "h", "l", "m", "n", file))
+	empty = suite.fileCache.IsDirEmpty(
+		internal.IsDirEmptyOptions{Name: filepath.Join("h", "l", "m", "n")},
+	)
+	suite.assert.True(empty)
+
+	// Delete file only on remote and not on local and validate the directory is still not empty
+	h, err = suite.fileCache.CreateFile(
+		internal.CreateFileOptions{Name: filepath.Join("h", "l", "m", "n", file), Mode: 0777},
+	)
+	suite.assert.NoError(err)
+	suite.assert.NotNil(h)
+	err = suite.fileCache.CloseFile(internal.CloseFileOptions{Handle: h})
+	suite.assert.NoError(err)
+	empty = suite.fileCache.IsDirEmpty(
+		internal.IsDirEmptyOptions{Name: filepath.Join("h", "l", "m", "n")},
+	)
+	suite.assert.False(empty)
+
+	os.Remove(filepath.Join(suite.fake_storage_path, "h", "l", "m", "n", file))
+	empty = suite.fileCache.IsDirEmpty(
+		internal.IsDirEmptyOptions{Name: filepath.Join("h", "l", "m", "n")},
+	)
+	suite.assert.False(empty)
+	os.Remove(filepath.Join(suite.cache_path, "h", "l", "m", "n", file))
+	empty = suite.fileCache.IsDirEmpty(
+		internal.IsDirEmptyOptions{Name: filepath.Join("h", "l", "m", "n")},
+	)
+	suite.assert.True(empty)
+}
+
+func (suite *fileCacheTestSuite) createLocalDirectoryStructure() {
 	err := os.MkdirAll(filepath.Join(suite.cache_path, "a", "b", "c", "d"), 0777)
 	suite.assert.NoError(err)
 
@@ -2891,48 +2984,25 @@ func (suite *fileCacheTestSuite) createDirectoryStructure() {
 	err = os.MkdirAll(filepath.Join(suite.cache_path, "a", "b", "e", "g"), 0777)
 	suite.assert.NoError(err)
 
-	err = os.MkdirAll(filepath.Join(suite.cache_path, "h", "i", "j", "k"), 0777)
-	suite.assert.NoError(err)
-
 	err = os.MkdirAll(filepath.Join(suite.cache_path, "h", "l", "m", "n"), 0777)
 	suite.assert.NoError(err)
 }
 
-func (suite *fileCacheTestSuite) TestDeleteEmptyDirsRoot() {
-	defer suite.cleanupTest()
-
-	suite.createDirectoryStructure()
-	val, err := suite.fileCache.DeleteEmptyDirs(internal.DeleteDirOptions{Name: suite.cache_path})
+func (suite *fileCacheTestSuite) createRemoteDirectoryStructure() {
+	err := os.MkdirAll(filepath.Join(suite.fake_storage_path, "a", "b", "c", "d"), 0777)
 	suite.assert.NoError(err)
-	suite.assert.True(val)
-}
 
-func (suite *fileCacheTestSuite) TestDeleteEmptyDirsNonRoot() {
-	defer suite.cleanupTest()
-
-	suite.createDirectoryStructure()
-	val, err := suite.fileCache.DeleteEmptyDirs(internal.DeleteDirOptions{Name: "a"})
+	err = os.MkdirAll(filepath.Join(suite.fake_storage_path, "a", "b", "e", "f"), 0777)
 	suite.assert.NoError(err)
-	suite.assert.True(val)
 
-	val, err = suite.fileCache.DeleteEmptyDirs(
-		internal.DeleteDirOptions{Name: filepath.Join(suite.cache_path, "h")},
-	)
+	err = os.MkdirAll(filepath.Join(suite.fake_storage_path, "a", "b", "e", "g"), 0777)
 	suite.assert.NoError(err)
-	suite.assert.True(val)
-}
 
-func (suite *fileCacheTestSuite) TestDeleteEmptyDirsNegative() {
-	defer suite.cleanupTest()
-
-	suite.createDirectoryStructure()
-	file, err := os.Create(filepath.Join(suite.cache_path, "h", "l", "m", "n", "file.txt"))
+	err = os.MkdirAll(filepath.Join(suite.fake_storage_path, "h", "i", "j", "k"), 0777)
 	suite.assert.NoError(err)
-	file.Close()
 
-	val, err := suite.fileCache.DeleteEmptyDirs(internal.DeleteDirOptions{Name: suite.cache_path})
-	suite.assert.Error(err)
-	suite.assert.False(val)
+	err = os.MkdirAll(filepath.Join(suite.fake_storage_path, "h", "l", "m", "n"), 0777)
+	suite.assert.NoError(err)
 }
 
 // In order for 'go test' to run this suite, we need to create

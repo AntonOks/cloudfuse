@@ -70,6 +70,10 @@ func (AuthType) AZCLI() AuthType {
 	return AuthType(5)
 }
 
+func (AuthType) WORKLOADIDENTITY() AuthType {
+	return AuthType(6)
+}
+
 func (a AuthType) String() string {
 	return enum.StringInt(a, reflect.TypeOf(a))
 }
@@ -138,6 +142,7 @@ const (
 	EnvAzAuthResource                    = "AZURE_STORAGE_AUTH_RESOURCE"
 	EnvAzStorageCpkEncryptionKey         = "AZURE_STORAGE_CPK_ENCRYPTION_KEY"
 	EnvAzStorageCpkEncryptionKeySha256   = "AZURE_STORAGE_CPK_ENCRYPTION_KEY_SHA256"
+	EnvAzUserAssertion                   = "AZURE_STORAGE_USER_ASSERTION"
 )
 
 type AzStorageOptions struct {
@@ -184,12 +189,7 @@ type AzStorageOptions struct {
 	CPKEncryptionKeySha256  string `config:"cpk-encryption-key-sha256"     yaml:"cpk-encryption-key-sha256"`
 	PreserveACL             bool   `config:"preserve-acl"                  yaml:"preserve-acl"`
 	Filter                  string `config:"filter"                        yaml:"filter"`
-
-	// v1 support
-	UseAdls        bool   `config:"use-adls"         yaml:"-"`
-	UseHTTPS       bool   `config:"use-https"        yaml:"-"`
-	SetContentType bool   `config:"set-content-type" yaml:"-"`
-	CaCertFile     string `config:"ca-cert-file"     yaml:"-"`
+	UserAssertion           string `config:"user-assertion"                yaml:"user-assertions"`
 }
 
 // RegisterEnvVariables : Register environment variables
@@ -225,6 +225,7 @@ func RegisterEnvVariables() {
 	config.BindEnv("azstorage.cpk-encryption-key", EnvAzStorageCpkEncryptionKey)
 	config.BindEnv("azstorage.cpk-encryption-key-sha256", EnvAzStorageCpkEncryptionKeySha256)
 
+	config.BindEnv("azstorage.user-assertion", EnvAzUserAssertion)
 }
 
 //    ----------- Config Parsing and Validation  ---------------
@@ -304,27 +305,19 @@ func ParseAndValidateConfig(az *AzStorage, opt AzStorageOptions) error {
 		opt.AccountType = "block"
 	}
 
-	if config.IsSet(compName + ".use-adls") {
-		if opt.UseAdls {
-			az.stConfig.authConfig.AccountType = az.stConfig.authConfig.AccountType.ADLS()
-		} else {
-			az.stConfig.authConfig.AccountType = az.stConfig.authConfig.AccountType.BLOCK()
-		}
-	} else {
-		var accountType AccountType
-		err := accountType.Parse(opt.AccountType)
-		if err != nil {
-			log.Err("ParseAndValidateConfig : Failed to parse account type %s", opt.AccountType)
-			return errors.New("invalid account type")
-		}
-
-		if accountType == EAccountType.INVALID_ACC() {
-			log.Err("ParseAndValidateConfig : Invalid account type %s", opt.AccountType)
-			return errors.New("invalid account type")
-		}
-
-		az.stConfig.authConfig.AccountType = accountType
+	var accountType AccountType
+	err := accountType.Parse(opt.AccountType)
+	if err != nil {
+		log.Err("ParseAndValidateConfig : Failed to parse account type %s", opt.AccountType)
+		return errors.New("invalid account type")
 	}
+
+	if accountType == EAccountType.INVALID_ACC() {
+		log.Err("ParseAndValidateConfig : Invalid account type %s", opt.AccountType)
+		return errors.New("invalid account type")
+	}
+
+	az.stConfig.authConfig.AccountType = accountType
 
 	if opt.BlockSize != 0 {
 		if opt.BlockSize > blockblob.MaxStageBlockBytes {
@@ -338,7 +331,7 @@ func ParseAndValidateConfig(az *AzStorage, opt AzStorageOptions) error {
 	}
 
 	// Validate container name is present or not
-	err := config.UnmarshalKey("mount-all-containers", &az.stConfig.mountAllContainers)
+	err = config.UnmarshalKey("mount-all-containers", &az.stConfig.mountAllContainers)
 	if err != nil {
 		log.Err("ParseAndValidateConfig : Failed to detect mount-all-container")
 	}
@@ -348,10 +341,6 @@ func ParseAndValidateConfig(az *AzStorage, opt AzStorageOptions) error {
 	}
 
 	az.stConfig.container = opt.Container
-
-	if config.IsSet(compName + ".use-https") {
-		opt.UseHTTP = !opt.UseHTTPS
-	}
 
 	az.stConfig.restrictedCharsWin = opt.RestrictedCharsWin
 
@@ -487,6 +476,16 @@ func ParseAndValidateConfig(az *AzStorage, opt AzStorageOptions) error {
 		az.stConfig.authConfig.WorkloadIdentityToken = opt.WorkloadIdentityToken
 	case EAuthType.AZCLI():
 		az.stConfig.authConfig.AuthMode = EAuthType.AZCLI()
+	case EAuthType.WORKLOADIDENTITY():
+		az.stConfig.authConfig.AuthMode = EAuthType.WORKLOADIDENTITY()
+		if opt.ClientID == "" || opt.TenantID == "" || opt.ApplicationID == "" {
+			return errors.New("client ID, tenant ID or application ID not provided")
+		}
+
+		az.stConfig.authConfig.ClientID = opt.ClientID
+		az.stConfig.authConfig.TenantID = opt.TenantID
+		az.stConfig.authConfig.ApplicationID = opt.ApplicationID
+		az.stConfig.authConfig.UserAssertion = opt.UserAssertion
 
 	default:
 		log.Err("ParseAndValidateConfig : Invalid auth mode %s", opt.AuthMode)

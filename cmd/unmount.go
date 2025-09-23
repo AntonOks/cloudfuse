@@ -34,6 +34,7 @@ import (
 	"strings"
 
 	"github.com/Seagate/cloudfuse/common"
+	"github.com/Seagate/cloudfuse/common/log"
 
 	"github.com/spf13/cobra"
 )
@@ -46,15 +47,24 @@ var unmountCmd = &cobra.Command{
 	Args:              cobra.ExactArgs(1),
 	FlagErrorHandling: cobra.ExitOnError,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		mountPath := common.ExpandPath(args[0])
+
+		disableRemountSystem, _ := cmd.Flags().GetBool("disable-remount-system")
 		if runtime.GOOS == "windows" {
 			disableRemountUser, _ := cmd.Flags().GetBool("disable-remount-user")
-			disableRemountSystem, _ := cmd.Flags().GetBool("disable-remount-system")
-			options.MountPath = strings.ReplaceAll(common.ExpandPath(args[0]), "\\", "/")
-			return unmountCloudfuseWindows(
-				options.MountPath,
-				disableRemountUser,
-				disableRemountSystem,
-			)
+			mountPath = strings.ReplaceAll(common.ExpandPath(args[0]), "\\", "/")
+			return unmountCloudfuseWindows(mountPath, disableRemountUser, disableRemountSystem)
+		}
+
+		if runtime.GOOS == "linux" && disableRemountSystem {
+			err := uninstallService(mountPath)
+			if err != nil {
+				return fmt.Errorf(
+					"failed to unmount and disable remount on restart for mount %s [%s]",
+					mountPath,
+					err.Error(),
+				)
+			}
 		}
 
 		lazy, _ := cmd.Flags().GetBool("lazy")
@@ -65,14 +75,14 @@ var unmountCmd = &cobra.Command{
 			for _, mntPath := range lstMnt {
 				match, _ := regexp.MatchString(mntPathPrefix, mntPath)
 				if match {
-					err := unmountCloudfuse(mntPath, lazy)
+					err := unmountCloudfuse(mntPath, lazy, false)
 					if err != nil {
 						return fmt.Errorf("failed to unmount %s [%s]", mntPath, err.Error())
 					}
 				}
 			}
 		} else {
-			err := unmountCloudfuse(args[0], lazy)
+			err := unmountCloudfuse(args[0], lazy, false)
 			if err != nil {
 				return err
 			}
@@ -89,7 +99,7 @@ var unmountCmd = &cobra.Command{
 }
 
 // Attempts to unmount the directory and returns true if the operation succeeded
-func unmountCloudfuse(mntPath string, lazy bool) error {
+func unmountCloudfuse(mntPath string, lazy bool, silent bool) error {
 	unmountCmd := []string{"fusermount3", "fusermount"}
 
 	var errb bytes.Buffer
@@ -105,7 +115,10 @@ func unmountCloudfuse(mntPath string, lazy bool) error {
 		_, err = cliOut.Output()
 
 		if err == nil {
-			fmt.Println("Successfully unmounted", mntPath)
+			log.Info("unmountBlobfuse2 : successfully unmounted %s", mntPath)
+			if !silent {
+				fmt.Println("Successfully unmounted", mntPath)
+			}
 			return nil
 		}
 
@@ -132,7 +145,8 @@ func init() {
 	if runtime.GOOS == "windows" {
 		unmountCmd.Flags().
 			Bool("disable-remount-user", false, "Disable remounting this mount on server restart as user.")
-		unmountCmd.Flags().
-			Bool("disable-remount-system", false, "Disable remounting this mount on server restart as system.")
 	}
+
+	unmountCmd.Flags().
+		Bool("disable-remount-system", false, "Disable remounting this mount on server restart as system.")
 }

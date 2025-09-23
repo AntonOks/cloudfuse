@@ -75,6 +75,7 @@ type Libfuse struct {
 	umask                 uint32
 	displayCapacityMb     uint64
 	windowsSDDL           string
+	disableKernelCache    bool
 }
 
 // To support pagination in readdir calls this structure holds a block of items for a given directory
@@ -206,6 +207,12 @@ func (lf *Libfuse) Validate(opt *LibfuseOptions) error {
 	lf.ownerUID = opt.Uid
 	lf.umask = opt.Umask
 	lf.windowsSDDL = opt.WindowsSSDL
+
+	if lf.disableKernelCache {
+		opt.DirectIO = true
+		lf.directIO = true
+		log.Crit("Libfuse::Validate : Kernel cache disabled, setting direct-io mode in fuse")
+	}
 
 	if opt.allowOther {
 		lf.dirPermission = uint(common.DefaultAllowOtherPermissionBits)
@@ -348,10 +355,20 @@ func (lf *Libfuse) Configure(_ bool) error {
 		return err
 	}
 
+	_ = config.UnmarshalKey("disable-kernel-cache", &lf.disableKernelCache)
+
 	err = lf.Validate(&conf)
 	if err != nil {
 		log.Err("Libfuse::Configure : config error [invalid config settings]")
 		return fmt.Errorf("%s config error %s", lf.Name(), err.Error())
+	}
+
+	// Disable libfuse logs if the mount is not running in foreground.
+	// Currently as of 01-05-2025, we emit the libfuse logs only to the stdout.
+	if !common.ForegroundMount {
+		if lf.traceEnable {
+			lf.traceEnable = false
+		}
 	}
 
 	log.Crit(
@@ -394,56 +411,4 @@ func NewLibfuseComponent() internal.Component {
 // On init register this component to pipeline and supply your constructor
 func init() {
 	internal.AddComponent(compName, NewLibfuseComponent)
-
-	attrTimeoutFlag := config.AddUint32Flag("attr-timeout", 0, " The attribute timeout in seconds")
-	config.BindPFlag(compName+".attribute-expiration-sec", attrTimeoutFlag)
-
-	entryTimeoutFlag := config.AddUint32Flag("entry-timeout", 0, "The entry timeout in seconds.")
-	config.BindPFlag(compName+".entry-expiration-sec", entryTimeoutFlag)
-
-	negativeTimeoutFlag := config.AddUint32Flag(
-		"negative-timeout",
-		0,
-		"The negative entry timeout in seconds.",
-	)
-	config.BindPFlag(compName+".negative-entry-expiration-sec", negativeTimeoutFlag)
-
-	allowOther := config.AddBoolFlag(
-		"allow-other",
-		false,
-		"Allow other users to access this mount point.",
-	)
-	config.BindPFlag("allow-other", allowOther)
-
-	disableWritebackCache := config.AddBoolFlag(
-		"disable-writeback-cache",
-		false,
-		"Disallow libfuse to buffer write requests if you must strictly open files in O_WRONLY or O_APPEND mode.",
-	)
-	config.BindPFlag(compName+".disable-writeback-cache", disableWritebackCache)
-
-	debug := config.AddBoolPFlag("d", false, "Mount with foreground and FUSE logs on.")
-	config.BindPFlag(compName+".fuse-trace", debug)
-	debug.Hidden = true
-
-	ignoreOpenFlags := config.AddBoolFlag(
-		"ignore-open-flags",
-		true,
-		"Ignore unsupported open flags (APPEND, WRONLY) by cloudfuse when writeback caching is enabled.",
-	)
-	config.BindPFlag(compName+".ignore-open-flags", ignoreOpenFlags)
-
-	networkShareFlags := config.AddBoolFlag(
-		"network-share",
-		false,
-		"Run as a network share. Only supported on Windows.",
-	)
-	config.BindPFlag(compName+".network-share", networkShareFlags)
-
-	displayCapacityFlag := config.AddUint64Flag(
-		"display-capacity-mb",
-		common.DefaultCapacityMb,
-		"Storage capacity to display.",
-	)
-	config.BindPFlag(compName+".display-capacity-mb", displayCapacityFlag)
 }

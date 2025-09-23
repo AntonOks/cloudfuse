@@ -30,10 +30,15 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"html/template"
 	"os"
+	"os/exec"
 	"os/signal"
+	"os/user"
+	"path/filepath"
 	"runtime"
 	"runtime/pprof"
+	"strings"
 	"time"
 
 	"github.com/Seagate/cloudfuse/common/config"
@@ -43,6 +48,12 @@ import (
 	"github.com/sevlyar/go-daemon"
 	"golang.org/x/sys/unix"
 )
+
+type serviceOptions struct {
+	ConfigFile  string
+	MountPath   string
+	ServiceUser string
+}
 
 func createDaemon(
 	pipeline *internal.Pipeline,
@@ -60,13 +71,11 @@ func createDaemon(
 	}
 
 	// Signal handlers for parent and child to communicate success or failures in mount
-	var sigusr2, sigchild chan os.Signal
+	var sigusr2 chan os.Signal
 	if !daemon.WasReborn() { // execute in parent only
 		sigusr2 = make(chan os.Signal, 1)
 		signal.Notify(sigusr2, unix.SIGUSR2)
 
-		sigchild = make(chan os.Signal, 1)
-		signal.Notify(sigchild, unix.SIGCHLD)
 	} else { // execute in child only
 		daemon.SetSigHandler(sigusrHandler(pipeline, ctx), unix.SIGUSR1, unix.SIGUSR2)
 		go func() {
@@ -74,19 +83,23 @@ func createDaemon(
 		}()
 	}
 
+retry:
+	// If the .pid file is locked and there no blobfuse process owning it then we need to try
+	// a cleanup of the .pid file. If cleanup goes through then retry the daemonization.
 	child, err := dmnCtx.Reborn()
 	if err != nil {
-		log.Err("mount : failed to daemonize application [%v]", err)
-		return Destroy(fmt.Sprintf("failed to daemonize application [%s]", err.Error()))
+		log.Err("mount : failed to daemonize application [%s], trying auto cleanup", err.Error())
+		rmErr := os.Remove(pidFileName)
+		if rmErr != nil {
+			log.Err("mount : auto cleanup failed [%v]", rmErr.Error())
+			return Destroy(fmt.Sprintf("failed to daemonize application [%s]", err.Error()))
+		}
+		goto retry
 	}
 
 	log.Debug("mount: foreground disabled, child = %v", daemon.WasReborn())
 	if child == nil { // execute in child only
-		defer func() {
-			if err := dmnCtx.Release(); err != nil {
-				log.Err("Unable to release pid-file: %s", err.Error())
-			}
-		}()
+		defer dmnCtx.Release() // nolint
 
 		if options.CPUProfile != "" {
 			os.Remove(options.CPUProfile)
@@ -123,11 +136,15 @@ func createDaemon(
 	} else { // execute in parent only
 		defer os.Remove(fname)
 
+		childDone := make(chan struct{})
+
+		go monitorChild(child.Pid, childDone)
+
 		select {
 		case <-sigusr2:
 			log.Info("mount: Child [%v] mounted successfully at %s", child.Pid, options.MountPath)
 
-		case <-sigchild:
+		case <-childDone:
 			// Get error string from the child, stderr or child was redirected to a file
 			log.Info("mount: Child [%v] terminated from %s", child.Pid, options.MountPath)
 
@@ -135,17 +152,13 @@ func createDaemon(
 			if err != nil {
 				log.Err("mount: failed to read child [%v] failure logs [%s]", child.Pid, err.Error())
 				return Destroy(fmt.Sprintf("failed to mount, please check logs [%s]", err.Error()))
-			} else if len(buff) > 0 {
-				return Destroy(string(buff))
 			} else {
-				// Nothing was logged, so mount succeeded
-				return nil
+				return Destroy(string(buff))
 			}
 
 		case <-time.After(options.WaitForMount):
 			log.Info("mount: Child [%v : %s] status check timeout", child.Pid, options.MountPath)
 		}
-
 		_ = log.Destroy()
 	}
 	return nil
@@ -170,7 +183,161 @@ func createMountInstance(bool, bool) error {
 	return nil
 }
 
+func newService(mountPath string, configPath string, serviceUser string) (string, error) {
+	serviceTemplate := `
+[Unit]
+Description=Cloudfuse is an open source project developed to provide a virtual filesystem backed by S3 or Azure storage.
+After=network-online.target
+Requires=network-online.target
+
+[Service]
+# User service will run as.
+User={{.ServiceUser}}
+
+# Under the hood
+Type=forking
+ExecStart=/usr/bin/cloudfuse mount {{.MountPath}} --config-file={{.ConfigFile}} -o allow_other
+ExecStop=/usr/bin/fusermount -u {{.MountPath}} -z
+
+[Install]
+WantedBy=multi-user.target
+`
+	config := serviceOptions{
+		ConfigFile:  configPath,
+		MountPath:   mountPath,
+		ServiceUser: serviceUser,
+	}
+
+	tmpl, err := template.New("service").Parse(serviceTemplate)
+	if err != nil {
+		return "", fmt.Errorf("could not create a new service file: [%s]", err.Error())
+	}
+	serviceName, serviceFilePath := getService(mountPath)
+	err = os.Remove(serviceFilePath)
+	if err != nil && !os.IsNotExist(err) {
+		return "", fmt.Errorf("failed to replace the service file [%s]", err.Error())
+	}
+
+	var newFile *os.File
+	newFile, err = os.Create(serviceFilePath)
+	if err != nil {
+		return "", fmt.Errorf("could not create new service file: [%s]", err.Error())
+	}
+
+	err = tmpl.Execute(newFile, config)
+	if err != nil {
+		return "", fmt.Errorf("could not create new service file: [%s]", err.Error())
+	}
+	return serviceName, nil
+}
+
+func setUser(serviceUser string, mountPath string, configPath string) error {
+	_, err := user.Lookup(serviceUser)
+	if err != nil {
+		if strings.Contains(err.Error(), "unknown user") {
+			// create the user
+			userAddCmd := exec.Command("useradd", "-m", serviceUser)
+			err = userAddCmd.Run()
+			if err != nil {
+				return fmt.Errorf("failed to create user [%s]", err.Error())
+			}
+			fmt.Println("user " + serviceUser + " has been created")
+		}
+	}
+	// advise on required permissions
+	fmt.Println(
+		"ensure the user, " + serviceUser + ", has the following access: \n" + mountPath + ": read, write, and execute \n" + configPath + ": read",
+	)
+	return nil
+}
+
+func getService(mountPath string) (string, string) {
+	serviceName := strings.ReplaceAll(mountPath, "/", "-")
+	serviceFile := "cloudfuse" + serviceName + ".service"
+	serviceFilePath := "/etc/systemd/system/" + serviceFile
+	return serviceName, serviceFilePath
+}
+
+func installRemountService(
+	serviceUser string,
+	mountPath string,
+	configPath string,
+) (string, error) {
+	//create the new user and set permissions
+	mountPath, err := filepath.Abs(mountPath)
+	if err != nil {
+		return "", fmt.Errorf("installService: Failed to get absolute mount path")
+	}
+
+	configPath, err = filepath.Abs(configPath)
+	if err != nil {
+		return "", fmt.Errorf("installService: Failed to get absolute mount path")
+	}
+
+	err = setUser(serviceUser, mountPath, configPath)
+	if err != nil {
+		fmt.Println("could not set up service user ", err)
+		return "", err
+	}
+
+	serviceName, err := newService(mountPath, configPath, serviceUser)
+	if err != nil {
+		return "", fmt.Errorf("unable to create service file: [%s]", err.Error())
+	}
+	// run systemctl daemon-reload
+	systemctlDaemonReloadCmd := exec.Command("systemctl", "daemon-reload")
+	err = systemctlDaemonReloadCmd.Run()
+	if err != nil {
+		return "", fmt.Errorf("failed to run 'systemctl daemon-reload' command [%s]", err.Error())
+	}
+	// Enable the service to start at system boot
+	systemctlEnableCmd := exec.Command("systemctl", "enable", serviceName)
+	err = systemctlEnableCmd.Run()
+	if err != nil {
+		return "", fmt.Errorf(
+			"failed to run 'systemctl daemon-reload' command due to following [%s]",
+			err.Error(),
+		)
+	}
+	return serviceName, nil
+}
+
+func startService(serviceName string) error {
+	systemctlEnableCmd := exec.Command("systemctl", "start", serviceName)
+	err := systemctlEnableCmd.Run()
+	if err != nil {
+		return fmt.Errorf(
+			"failed to run 'systemctl daemon-reload' command due to following [%s]",
+			err.Error(),
+		)
+	}
+	return nil
+}
+
 // stub for compilation
 func readPassphraseFromPipe(pipeName string, timeout time.Duration) (string, error) {
 	return "", nil
+}
+
+func monitorChild(pid int, done chan struct{}) {
+	// Monitor the child process and if child terminates then exit
+	var wstatus unix.WaitStatus
+
+	for {
+		// Wait for a signal from child
+		wpid, err := unix.Wait4(pid, &wstatus, 0, nil)
+		if err != nil {
+			log.Err("Error retrieving child status [%s]", err.Error())
+			break
+		}
+
+		if wpid == pid {
+			// Exit only if child has exited
+			// Signal can be received on a state change of child as well
+			if wstatus.Exited() || wstatus.Signaled() || wstatus.Stopped() {
+				close(done)
+				return
+			}
+		}
+	}
 }

@@ -99,6 +99,8 @@ type ReadInBufferOptions struct {
 	Offset int64
 	Etag   *string
 	Data   []byte
+	Path   string
+	Size   int64
 }
 
 type WriteFileOptions struct {
@@ -133,7 +135,7 @@ type CopyFromFileOptions struct {
 type FlushFileOptions struct {
 	Handle          *handlemap.Handle
 	CloseInProgress bool
-	ImmediateUpload bool
+	AsyncUpload     bool
 }
 
 type SyncFileOptions struct {

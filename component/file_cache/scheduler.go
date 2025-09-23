@@ -1,3 +1,27 @@
+/*
+	Licensed under the MIT License <http://opensource.org/licenses/MIT>.
+
+	Copyright © 2023-2025 Seagate Technology LLC and/or its Affiliates
+
+	Permission is hereby granted, free of charge, to any person obtaining a copy
+	of this software and associated documentation files (the "Software"), to deal
+	in the Software without restriction, including without limitation the rights
+	to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+	copies of the Software, and to permit persons to whom the Software is
+	furnished to do so, subject to the following conditions:
+
+	The above copyright notice and this permission notice shall be included in all
+	copies or substantial portions of the Software.
+
+	THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+	IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+	FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+	AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+	LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+	OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+	SOFTWARE.
+*/
+
 package file_cache
 
 import (
@@ -80,7 +104,12 @@ func (fc *FileCache) scheduleUploads(c *cron.Cron, sched WeeklySchedule) {
 				startFunc()
 			}
 
-			log.Info("schedule [%s] starting (active windows=%d)", windowName, windowCount)
+			log.Info(
+				"schedule [%s] (%s) starting (active windows=%d)\n",
+				windowName,
+				config.CronExpr,
+				windowCount,
+			)
 			fc.serviceScheduledOps()
 
 			// When should the window close?
@@ -89,6 +118,7 @@ func (fc *FileCache) scheduleUploads(c *cron.Cron, sched WeeklySchedule) {
 			if initialWindowEndTime.After(currentTime) {
 				remainingDuration = initialWindowEndTime.Sub(currentTime)
 			}
+
 			// Create a context to end the window
 			window, cancel := context.WithTimeout(context.Background(), remainingDuration)
 			defer cancel()
@@ -130,10 +160,11 @@ func (fc *FileCache) scheduleUploads(c *cron.Cron, sched WeeklySchedule) {
 		// check if this schedule should already be active
 		// did this schedule have a start time within the last duration?
 		schedule := c.Entry(cronEntryId)
-		currentTime := time.Now()
-		currentWindowStartTime := schedule.Schedule.Next(currentTime.Add(-duration))
-		if currentTime.After(currentWindowStartTime) {
-			initialWindowEndTime = currentWindowStartTime.Add(duration)
+		now := time.Now()
+		for t := schedule.Schedule.Next(now.Add(-duration)); now.After(t); t = schedule.Schedule.Next(t) {
+			initialWindowEndTime = t.Add(duration)
+		}
+		if !initialWindowEndTime.IsZero() {
 			go schedule.Job.Run()
 		}
 	}
@@ -186,7 +217,7 @@ func (fc *FileCache) serviceScheduledOps() {
 	})
 
 	log.Info(
-		"FileCache::serviceScheduledOps : Completed upload cycle, processed %d files",
+		"FileCache::servicePendingOps : Completed upload cycle, processed %d files",
 		numFilesProcessed,
 	)
 }

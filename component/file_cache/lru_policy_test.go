@@ -193,7 +193,7 @@ func (suite *lruPolicyTestSuite) TestCacheValid() {
 	suite.assert.NotNil(n)
 	node := n.(*lruNode)
 	suite.assert.Equal("temp", node.name)
-	suite.assert.Equal(1, node.usage)
+	suite.assert.Equal(int64(1), node.usage.Load())
 }
 
 func (suite *lruPolicyTestSuite) TestCachePurge() {
@@ -308,11 +308,12 @@ func (suite *lruPolicyTestSuite) TestMaxEviction() {
 
 func (suite *lruPolicyTestSuite) verifyPolicy(expectedPolicy, actualPolicy *lruPolicy) {
 	for expected, actual := expectedPolicy.head, actualPolicy.head; expected != nil || actual != nil; expected, actual = expected.next, actual.next {
-		if expected == expectedPolicy.currMarker {
+		switch expected {
+		case expectedPolicy.currMarker:
 			suite.assert.Same(actualPolicy.currMarker, actual)
-		} else if expected == expectedPolicy.lastMarker {
+		case expectedPolicy.lastMarker:
 			suite.assert.Same(actualPolicy.lastMarker, actual)
-		} else {
+		default:
 			suite.assert.Equal(expected.name, actual.name)
 		}
 		suite.assert.NotNil(actual, "actual list is shorter than expected")
